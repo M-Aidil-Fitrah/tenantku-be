@@ -91,13 +91,11 @@ Jalankan skrip role dengan `-v booking_hold=true`. Set `BOOKING_MAX_ACTIVE_HOLDS
 
 Login menolak akun yang emailnya belum diverifikasi dengan `403 EMAIL_NOT_VERIFIED`, tetapi hanya setelah kata sandi cocok. Ini aktif secara bawaan. Isi `AUTH_REQUIRE_VERIFIED_EMAIL=false` untuk QA lokal. Akun lama yang belum terverifikasi tidak diubah otomatis. Di database QA, verifikasi manual dengan `UPDATE users SET email_verified_at = now() WHERE email_verified_at IS NULL;` atau minta tautan lewat halaman verifikasi email.
 
-Migration mengisi tarif paket Mini hingga Large dan tarif dasar Custom. Custom menambah Rp5.000 per stand di atas 100. Pembelian lama tetap memakai harga dan kapasitas yang tercatat saat dibuat. Isi `EVENT_PLAN_REQUIRED=true` untuk mewajibkan paket aktif dan menegakkan kapasitas saat menyimpan denah dan menerbitkan acara. Pembelian paket berbayar memakai Midtrans Sandbox dan webhook yang sama dengan sewa stand.
+Paket acara berbayar (E16-04) memakai tabel `event_plans`. Paket `standard` dibuat dengan harga Rp0, jadi aktif tanpa pembayaran. Ubah `price` di tabel itu sebelum produksi. Isi `EVENT_PLAN_REQUIRED=true` agar publikasi menuntut paket aktif dan batas stand dari paket. Nilai bawaan kosong, sehingga acara yang ada tidak terpengaruh. Pembelian paket berbayar memakai Midtrans dan webhook yang sama dengan sewa stand.
+
+Metode bayar sewa (E08) dirilis lewat tabel `payment_methods`: `bank_transfer`, `qris`, dan `gopay`, dengan biaya admin per metode yang ditanggung tenant. Tarif bawaan adalah estimasi dan harus diganti dengan tarif kontrak. `go run . payments check` memverifikasi channel di sandbox dan `go run . payments reconcile` merekonsiliasi attempt dan ledger. Detail, ledger, dan langkah uji webhook hosted ada di [docs/pembayaran-midtrans.md](docs/pembayaran-midtrans.md). Isi `MIDTRANS_CLIENT_KEY` untuk perintah `check`.
 
 Untuk menguji API pembayaran, terapkan migration dan jalankan skrip role dengan `-v payment_sandbox=true`. Isi `MIDTRANS_ENV=sandbox` dan `MIDTRANS_SERVER_KEY` dengan kredensial sandbox di environment API. Kosongkan server key dan jalankan ulang skrip role tanpa flag sandbox saat pembayaran tidak digunakan. API memverifikasi status langsung ke Midtrans sebelum mengubah booking.
-
-Untuk memproses instruksi refund pembatalan di sandbox, pasang konfigurasi Midtrans yang sama pada worker dan set `EVENT_REFUND_SANDBOX_ENABLED=true`. Worker mengirim refund parsial QRIS dengan referensi yang stabil, lalu menunggu konfirmasi bank dari hasil pengecekan provider sebelum mencatat jurnal. Metode seperti VA masuk status `manual_review` untuk tindak lanjut operasional.
-
-Setelah transfer eksternal untuk BCA VA dikonfirmasi dan bukti bank tersedia, operator database dapat mencatatnya dengan `go run . record-va-refund <booking-id> <nominal-idr> <referensi-bank>`. Perintah hanya mencatat transfer yang sudah selesai. Gunakan role operator yang diizinkan menulis bukti dan jurnal. Role runtime API serta worker tidak mendapat akses untuk mencatat bukti transfer. Percobaan ulang dengan nominal dan referensi yang sama aman.
 
 ## Verifikasi lokal
 

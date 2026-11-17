@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -55,9 +54,8 @@ type PlanCheckout struct {
 }
 
 type PlanInput struct {
-	PlanCode       string `json:"plan_code"`
-	Method         string `json:"method"`
-	CapacityStands *int   `json:"capacity_stands,omitempty"`
+	PlanCode string `json:"plan_code"`
+	Method   string `json:"method"`
 }
 
 const purchaseColumns = `p.id, p.event_id, p.plan_code, p.status, p.amount, p.capacity_stands, p.activated_at`
@@ -130,14 +128,6 @@ func (s Store) PurchasePlan(ctx context.Context, actor, email, eventID, key stri
 		return PlanCheckout{}, false, pgx.ErrNoRows
 	}
 	digest := sha256.Sum256([]byte("plan\x00" + eventID + "\x00" + input.PlanCode + "\x00" + input.Method))
-	if input.PlanCode == "custom" {
-		if input.CapacityStands == nil || *input.CapacityStands < 101 || *input.CapacityStands > 500 {
-			return PlanCheckout{}, false, ErrPlanUnknown
-		}
-		digest = sha256.Sum256(strconv.AppendInt(append(digest[:], 0), int64(*input.CapacityStands), 10))
-	} else if input.CapacityStands != nil {
-		return PlanCheckout{}, false, ErrPlanUnknown
-	}
 	var result PlanCheckout
 	var created bool
 	err := pgx.BeginTxFunc(ctx, s.DB, pgx.TxOptions{}, func(tx pgx.Tx) error {
@@ -196,10 +186,6 @@ func (s Store) PurchasePlan(ctx context.Context, actor, email, eventID, key stri
 		} else if err != nil {
 			return err
 		}
-		if input.PlanCode == "custom" {
-			capacity = input.CapacityStands
-			price += int64(*capacity-100) * 5000
-		}
 
 		purchase, err := scanPurchase(tx.QueryRow(ctx, `SELECT `+purchaseColumns+` FROM event_plan_purchases p
 			WHERE p.event_id = $1 AND p.status = 'pending' FOR UPDATE`, eventID))
@@ -207,8 +193,7 @@ func (s Store) PurchasePlan(ctx context.Context, actor, email, eventID, key stri
 			purchase, err = scanPurchase(tx.QueryRow(ctx, `INSERT INTO event_plan_purchases AS p
 				(event_id, plan_code, purchased_by, amount, capacity_stands) VALUES ($1, $2, $3, $4, $5)
 				RETURNING `+purchaseColumns, eventID, input.PlanCode, actor, price, capacity))
-		} else if err == nil && (purchase.PlanCode != input.PlanCode ||
-			(input.PlanCode == "custom" && (purchase.CapacityStands == nil || *purchase.CapacityStands != *capacity))) {
+		} else if err == nil && purchase.PlanCode != input.PlanCode {
 			var live int
 			if err := tx.QueryRow(ctx, `SELECT count(*) FROM payment_attempts WHERE purchase_id = $1
 				AND status IN ('created', 'pending')`, purchase.ID).Scan(&live); err != nil {
@@ -243,8 +228,8 @@ func (s Store) PurchasePlan(ctx context.Context, actor, email, eventID, key stri
 			return err
 		}
 		attempt, err := scanAttempt(tx.QueryRow(ctx, `INSERT INTO payment_attempts
-			(purchase_id, created_by, provider, method, status, amount, expires_at, idempotency_key, request_digest)
-			VALUES ($1, $2, 'midtrans', $3, 'created', $4, clock_timestamp() + $5::interval, $6, $7) RETURNING `+attemptColumns,
+			(purchase_id, created_by, provider, method, status, amount, base_amount, expires_at, idempotency_key, request_digest)
+			VALUES ($1, $2, 'midtrans', $3, 'created', $4, $4, clock_timestamp() + $5::interval, $6, $7) RETURNING `+attemptColumns,
 			purchase.ID, actor, input.Method, purchase.Amount, planPaymentWindow.String(), key, digest[:]))
 		if err != nil {
 			return err
@@ -279,12 +264,12 @@ func (s Store) openPlanAttempt(ctx context.Context, id, email string) (Attempt, 
 			result = attempt
 			return nil
 		}
-		var eventName, planName, purchaseID string
+		var eventName, planName, purchaseID, eventID, organizationID string
 		var remaining float64
-		if err := tx.QueryRow(ctx, `SELECT e.name, pl.name, p.id, EXTRACT(EPOCH FROM (a.expires_at - clock_timestamp()))::float8
+		if err := tx.QueryRow(ctx, `SELECT e.name, pl.name, p.id, e.id, e.organization_id, EXTRACT(EPOCH FROM (a.expires_at - clock_timestamp()))::float8
 			FROM payment_attempts a JOIN event_plan_purchases p ON p.id = a.purchase_id
 			JOIN events e ON e.id = p.event_id JOIN event_plans pl ON pl.code = p.plan_code
-			WHERE a.id = $1 AND p.status = 'pending'`, id).Scan(&eventName, &planName, &purchaseID, &remaining); errors.Is(err, pgx.ErrNoRows) {
+			WHERE a.id = $1 AND p.status = 'pending'`, id).Scan(&eventName, &planName, &purchaseID, &eventID, &organizationID, &remaining); errors.Is(err, pgx.ErrNoRows) {
 			return ErrPlanState
 		} else if err != nil {
 			return err
@@ -296,8 +281,12 @@ func (s Store) openPlanAttempt(ctx context.Context, id, email string) (Attempt, 
 		if len([]rune(name)) > 50 {
 			name = string([]rune(name)[:50])
 		}
-		snap, err := s.Provider.CreateSnap(ctx, id, attempt.Amount, email,
-			[]snapItem{{ID: purchaseID, Price: attempt.Amount, Quantity: 1, Name: name}}, time.Duration(remaining*float64(time.Second)))
+		snap, err := s.Provider.CreateSnap(ctx, SnapInput{
+			OrderID: id, Amount: attempt.Amount, Email: email,
+			Items:     []snapItem{{ID: purchaseID, Price: attempt.Amount, Quantity: 1, Name: name}},
+			Expiry:    time.Duration(remaining * float64(time.Second)),
+			FinishURL: s.finishURL("/penyelenggara/acara/" + eventID + "/paket?organisasi=" + organizationID),
+		})
 		if err != nil {
 			return err
 		}
@@ -351,21 +340,6 @@ func (s Store) applyPlan(ctx context.Context, tx pgx.Tx, attemptID, purchaseID, 
 		return "", err
 	}
 	return "applied", recordPlanPayment(ctx, tx, attemptID, amount)
-}
-
-func recordPlanPayment(ctx context.Context, tx pgx.Tx, attemptID string, amount int64) error {
-	var txID string
-	err := tx.QueryRow(ctx, `INSERT INTO ledger_transactions (kind, ref_type, ref_id)
-		VALUES ('plan_payment_received', 'payment_attempt', $1) ON CONFLICT DO NOTHING RETURNING id`, attemptID).Scan(&txID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO ledger_entries (transaction_id, account, direction, amount) VALUES
-		($1, 'provider_clearing', 'debit', $2), ($1, 'platform_revenue', 'credit', $2)`, txID, amount)
-	return err
 }
 
 func (s Store) planRoutes(api *gin.RouterGroup, sessions *auth.Service, origin string) {
