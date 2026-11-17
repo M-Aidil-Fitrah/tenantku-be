@@ -112,16 +112,14 @@ func (m *Midtrans) CreateSnap(ctx context.Context, orderID string, amount int64,
 
 // Notification is the subset of the Midtrans HTTP notification this service reads.
 type Notification struct {
-	OrderID           string           `json:"order_id"`
-	StatusCode        string           `json:"status_code"`
-	GrossAmount       string           `json:"gross_amount"`
-	SignatureKey      string           `json:"signature_key"`
-	TransactionStatus string           `json:"transaction_status"`
-	FraudStatus       string           `json:"fraud_status"`
-	TransactionID     string           `json:"transaction_id"`
-	Currency          string           `json:"currency"`
-	PaymentType       string           `json:"payment_type,omitempty"`
-	Refunds           []providerRefund `json:"refunds,omitempty"`
+	OrderID           string `json:"order_id"`
+	StatusCode        string `json:"status_code"`
+	GrossAmount       string `json:"gross_amount"`
+	SignatureKey      string `json:"signature_key"`
+	TransactionStatus string `json:"transaction_status"`
+	FraudStatus       string `json:"fraud_status"`
+	TransactionID     string `json:"transaction_id"`
+	Currency          string `json:"currency"`
 }
 
 // Status verifies the transaction state with Midtrans after a signed notification.

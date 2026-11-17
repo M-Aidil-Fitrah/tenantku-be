@@ -15,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"kitakarsa.com/tenantku/backend/internal/booking"
-	"kitakarsa.com/tenantku/backend/internal/payment"
+	"kitakarsa.com/tenantku/backend/internal/notify"
 )
 
 const (
@@ -23,6 +23,7 @@ const (
 	expiryInterval    = 5 * time.Second
 	expiryTimeout     = 15 * time.Second
 	expiryReadyWindow = 2*expiryInterval + expiryTimeout
+	notifyBatchSize   = 100
 )
 
 type expiryReadiness struct {
@@ -76,39 +77,16 @@ func runWorker(ctx context.Context, args []string) error {
 	defer pool.Close()
 	store := booking.Store{DB: pool}
 	err = store.Ready(startup)
+	notifications := notify.Store{DB: pool}
+	if err == nil {
+		err = notifications.WorkerReady(startup)
+	}
 	cancel()
 	if err != nil {
 		return fmt.Errorf("worker readiness check failed (%s); verify the database connection and run migrations", expiryErrorCode(err))
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil)).With("component", "booking_expiry")
-	var refunds payment.Store
-	if os.Getenv("EVENT_REFUND_SANDBOX_ENABLED") == "true" {
-		if os.Getenv("MIDTRANS_ENV") != "sandbox" || os.Getenv("MIDTRANS_SERVER_KEY") == "" {
-			return errors.New("sandbox refunds require MIDTRANS_ENV=sandbox and MIDTRANS_SERVER_KEY")
-		}
-		refunds = payment.Store{DB: pool, Provider: payment.NewMidtrans(os.Getenv("MIDTRANS_SERVER_KEY"), "sandbox")}
-	}
-	runBatch := func() error {
-		if err := expireBatch(ctx, store, logger); err != nil {
-			return err
-		}
-		if refunds.Provider == nil {
-			return nil
-		}
-		probe, stop := context.WithTimeout(ctx, expiryTimeout)
-		defer stop()
-		err := refunds.ProcessCancellationRefund(probe)
-		if err != nil {
-			logger.Error("event refund processing failed", "error_code", expiryErrorCode(err))
-		}
-		reconcile, finish := context.WithTimeout(ctx, expiryTimeout)
-		defer finish()
-		reconciliationErr := refunds.ReconcileCancelledPayment(reconcile)
-		if reconciliationErr != nil {
-			logger.Error("cancelled booking payment reconciliation failed", "error_code", expiryErrorCode(reconciliationErr))
-		}
-		return errors.Join(err, reconciliationErr)
-	}
+	base := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	logger := base.With("component", "booking_expiry")
 	var readiness expiryReadiness
 	var listenerErrors <-chan error
 	if address := os.Getenv("WORKER_HEALTH_ADDR"); !once && address != "" {
@@ -126,8 +104,12 @@ func runWorker(ctx context.Context, args []string) error {
 		go func() { failure <- server.Serve(listener) }()
 	}
 	logger.Info("worker started", "interval", expiryInterval.String(), "once", once)
+	notifyLogger := base.With("component", "notifications")
 	if once {
-		return runBatch()
+		if err := expireBatch(ctx, store, logger); err != nil {
+			return err
+		}
+		return notifyBatch(ctx, notifications, notifyLogger)
 	}
 
 	timer := time.NewTimer(0)
@@ -141,10 +123,12 @@ func runWorker(ctx context.Context, args []string) error {
 			return fmt.Errorf("worker readiness server: %w", err)
 		case <-timer.C:
 			// A failure is logged with its job ID and retried on the next cycle.
-			err := runBatch()
+			err := expireBatch(ctx, store, logger)
 			if ctx.Err() == nil {
 				readiness.record(err, time.Now())
 			}
+			// Kegagalan notifikasi dicatat saja; hold yang kedaluwarsa tetap jadi prioritas readiness.
+			_ = notifyBatch(ctx, notifications, notifyLogger)
 			timer.Reset(expiryInterval)
 		}
 	}
@@ -189,4 +173,33 @@ func expiryErrorCode(err error) string {
 	default:
 		return "database_unavailable"
 	}
+}
+
+// notifyBatch mengumpulkan peristiwa booking baru ke outbox lalu mengirim item yang jatuh tempo.
+func notifyBatch(ctx context.Context, store notify.Store, logger *slog.Logger) error {
+	probe, cancel := context.WithTimeout(ctx, expiryTimeout)
+	defer cancel()
+	job := logger.With("job_id", rand.Text())
+	collected, err := store.Collect(probe)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		code := expiryErrorCode(err)
+		job.Error("notification collect failed", "error_code", code)
+		return fmt.Errorf("notification collect failed (%s)", code)
+	}
+	delivered, failed, err := store.Deliver(probe, notifyBatchSize)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		code := expiryErrorCode(err)
+		job.Error("notification delivery failed", "error_code", code)
+		return fmt.Errorf("notification delivery failed (%s)", code)
+	}
+	if collected > 0 || delivered > 0 || failed > 0 {
+		job.Info("notifications processed", "collected", collected, "delivered", delivered, "failed", failed)
+	}
+	return nil
 }
