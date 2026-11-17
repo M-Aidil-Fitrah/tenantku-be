@@ -23,7 +23,6 @@ var (
 	ErrQuotaFull           = errors.New("category quota reached")
 	ErrPolicyChanged       = errors.New("accepted refund policy is no longer active")
 	ErrHoldPriceChanged    = errors.New("the quoted price is no longer available")
-	ErrEventDetailsChanged = errors.New("the event revision has changed")
 	ErrHoldUnavailable     = errors.New("hold configuration is unavailable")
 )
 
@@ -34,7 +33,6 @@ type HoldInput struct {
 	EventSlotID           string `json:"event_slot_id"`
 	AcceptedPolicyVersion string `json:"accepted_policy_version"`
 	ExpectedPrice         *Price `json:"expected_price,omitempty"`
-	EventRevisionID       string `json:"event_revision_id,omitempty"`
 }
 
 type HoldSettings struct {
@@ -51,8 +49,6 @@ type OfferRequest struct {
 }
 
 type Offer struct {
-	StandCode     string
-	BlockLabel    string
 	BlockID       *string
 	EventQuota    *int
 	BlockQuota    *int
@@ -102,9 +98,6 @@ func (s Store) createHold(ctx context.Context, actor, key string, input HoldInpu
 		!httpapi.ValidID(actor) || !validHoldKey(key) || !httpapi.ValidSingleLine(input.AcceptedPolicyVersion, 80) {
 		return Booking{}, false, ErrHoldInput
 	}
-	if input.EventRevisionID != "" && !normalizeHoldIDs(&input.EventRevisionID) {
-		return Booking{}, false, ErrHoldInput
-	}
 	payload, err := json.Marshal(input)
 	if err != nil {
 		return Booking{}, false, err
@@ -114,8 +107,8 @@ func (s Store) createHold(ctx context.Context, actor, key string, input HoldInpu
 	var result Booking
 	var created bool
 	err = pgx.BeginFunc(ctx, s.DB, func(tx pgx.Tx) error {
-		// Serialize idempotency by actor, followed by the hold limit, allocations,
-		// and category quotas for this event.
+		// Serialize hold limits and idempotency by actor, followed by all changes
+		// to allocations and category quotas for this event.
 		// Use a transaction lock so the booking role needs no UPDATE grant on users.
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(
 			hashtextextended('tenantku.booking.hold:' || $1::uuid::text, 0))`, actor); err != nil {
@@ -145,21 +138,12 @@ func (s Store) createHold(ctx context.Context, actor, key string, input HoldInpu
 		}
 
 		var terms *string
-		var mode string
-		if err := tx.QueryRow(ctx, `SELECT terms, registration_mode FROM events WHERE id = $1
-			AND status IN ('published', 'live') FOR NO KEY UPDATE`, input.EventID).Scan(&terms, &mode); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT terms FROM events WHERE id = $1
+			AND status IN ('published', 'live') FOR NO KEY UPDATE`, input.EventID).Scan(&terms); err != nil {
 			return err
 		}
-		// Curated events are booked only through an approved application.
-		if mode != "direct" || terms == nil || strings.TrimSpace(*terms) == "" {
+		if terms == nil || strings.TrimSpace(*terms) == "" {
 			return ErrNotBookable
-		}
-		var revision string
-		if err := tx.QueryRow(ctx, `SELECT `+currentEventRevisionSQL, input.EventID).Scan(&revision); err != nil {
-			return err
-		}
-		if input.EventRevisionID != revision {
-			return ErrEventDetailsChanged
 		}
 		var now, ends time.Time
 		if err := tx.QueryRow(ctx, `SELECT clock_timestamp(), ends_at FROM event_slots
@@ -174,9 +158,8 @@ func (s Store) createHold(ctx context.Context, actor, key string, input HoldInpu
 		}
 		var active int
 		if err := tx.QueryRow(ctx, `SELECT count(*) FROM bookings
-			WHERE created_by = $1 AND event_id = $2
-				AND status IN ('held', 'payment_pending') AND expires_at > $3`,
-			actor, input.EventID, now).Scan(&active); err != nil {
+			WHERE created_by = $1 AND status IN ('held', 'payment_pending') AND expires_at > $2`,
+			actor, now).Scan(&active); err != nil {
 			return err
 		}
 		if active >= settings.MaxActive {
@@ -206,7 +189,7 @@ func (s Store) createHold(ctx context.Context, actor, key string, input HoldInpu
 		if ends.Before(expires) {
 			expires = ends
 		}
-		result, err = insertHold(ctx, tx, actor, key, digest[:], input, category, *terms, expires, offer, "hold")
+		result, err = insertHold(ctx, tx, actor, key, digest[:], input, category, *terms, expires, offer)
 		created = err == nil
 		return err
 	})
@@ -237,7 +220,7 @@ func checkQuota(ctx context.Context, tx pgx.Tx, eventID, category string, now ti
 }
 
 func insertHold(ctx context.Context, tx pgx.Tx, actor, key string, digest []byte, input HoldInput,
-	category, terms string, expires time.Time, offer Offer, allocation string) (Booking, error) {
+	category, terms string, expires time.Time, offer Offer) (Booking, error) {
 	var id string
 	err := tx.QueryRow(ctx, `INSERT INTO bookings (business_id, event_id, category_id, created_by, status, expires_at,
 		price_revision, rent, platform_fee, provider_fee, terms_snapshot, refund_policy_version,
@@ -249,7 +232,7 @@ func insertHold(ctx context.Context, tx pgx.Tx, actor, key string, digest []byte
 		return Booking{}, err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO allocations (booking_id, event_id, event_slot_id, stand_id, block_id, status)
-		VALUES ($1, $2, $3, $4, $5, $6)`, id, input.EventID, input.EventSlotID, input.StandID, offer.BlockID, allocation)
+		VALUES ($1, $2, $3, $4, $5, 'hold')`, id, input.EventID, input.EventSlotID, input.StandID, offer.BlockID)
 	if err != nil {
 		var dbError *pgconn.PgError
 		if errors.As(err, &dbError) && dbError.ConstraintName == "allocations_active_stand_slot_idx" {

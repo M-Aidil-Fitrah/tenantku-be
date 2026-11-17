@@ -2,14 +2,11 @@ package identity
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-var errBusinessAlreadyExists = errors.New("account already owns a business")
 
 type Store struct {
 	DB *pgxpool.Pool
@@ -50,7 +47,7 @@ type consentEvent struct {
 
 func (s Store) Ready(ctx context.Context) error {
 	_, err := s.DB.Exec(ctx, `
-		SELECT 1 FROM memberships, businesses, organizations, business_categories, consent_events, signup_profiles LIMIT 0
+		SELECT 1 FROM memberships, businesses, organizations, business_categories, consent_events LIMIT 0
 	`)
 	return err
 }
@@ -66,51 +63,23 @@ func (s Store) memberships(ctx context.Context, userID string) ([]membership, er
 	return collect(rows, err, pgx.RowToStructByPos[membership])
 }
 
-// signup returns the phone and planned first event name given at registration, if any.
-func (s Store) signup(ctx context.Context, userID string) (phone, eventName *string, err error) {
-	err = s.DB.QueryRow(ctx, `SELECT phone, event_name FROM signup_profiles WHERE user_id = $1`, userID).Scan(&phone, &eventName)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil, nil
-	}
-	return phone, eventName, err
-}
-
 func (s Store) categories(ctx context.Context) ([]category, error) {
 	rows, err := s.DB.Query(ctx, `SELECT id, name FROM business_categories ORDER BY name, id`)
 	return collect(rows, err, pgx.RowToStructByPos[category])
 }
 
 func (s Store) createBusiness(ctx context.Context, userID, name, categoryID string) (business, error) {
-	var created business
-	err := pgx.BeginFunc(ctx, s.DB, func(tx pgx.Tx) error {
-		// Lock per owner before reading, including for accounts created under the old rule.
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(
-			hashtextextended('tenantku.identity.business:' || $1::uuid::text, 0))`, userID); err != nil {
-			return err
-		}
-		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (
-			SELECT 1 FROM businesses WHERE owner_id = $1
-		)`, userID).Scan(&exists); err != nil {
-			return err
-		}
-		if exists {
-			return errBusinessAlreadyExists
-		}
-		var err error
-		created, err = scanBusiness(tx.QueryRow(ctx, `
-			WITH created AS (
-				INSERT INTO businesses (owner_id, name, category_id) VALUES ($1, $2, $3)
-				RETURNING id, name, category_id
-			), joined AS (
-				INSERT INTO memberships (user_id, business_id, role)
-				SELECT $1, id, 'owner' FROM created RETURNING business_id
-			)
-			SELECT id, name, category_id FROM created JOIN joined ON business_id = id
-		`, userID, name, categoryID))
-		return err
-	})
-	return created, err
+	row := s.DB.QueryRow(ctx, `
+		WITH created AS (
+			INSERT INTO businesses (owner_id, name, category_id) VALUES ($1, $2, $3)
+			RETURNING id, name, category_id
+		), joined AS (
+			INSERT INTO memberships (user_id, business_id, role)
+			SELECT $1, id, 'owner' FROM created RETURNING business_id
+		)
+		SELECT id, name, category_id FROM created JOIN joined ON business_id = id
+	`, userID, name, categoryID)
+	return scanBusiness(row)
 }
 
 func (s Store) business(ctx context.Context, userID, id string) (business, error) {

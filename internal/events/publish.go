@@ -74,7 +74,7 @@ func (s Store) publicationReadiness(ctx context.Context, actor, id string, layou
 		if err := tx.QueryRow(ctx, `SELECT transaction_timestamp()`).Scan(&now); err != nil {
 			return err
 		}
-		err = s.withPlan(ctx, tx, current.ID, checkPublication(ctx, tx, current, layout, now))
+		err = checkPublication(ctx, tx, current, layout, now)
 		var fields fieldErrors
 		if errors.As(err, &fields) {
 			result.Fields = fields
@@ -104,7 +104,7 @@ func (s Store) publishDraft(ctx context.Context, actor, id string, layout Publis
 		if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
 			return err
 		}
-		if err := s.withPlan(ctx, tx, current.ID, checkPublication(ctx, tx, current, layout, now)); err != nil {
+		if err := checkPublication(ctx, tx, current, layout, now); err != nil {
 			return err
 		}
 		result, err = scanEvent(tx.QueryRow(ctx, `UPDATE events e SET status = 'published', updated_at = clock_timestamp()
@@ -198,50 +198,4 @@ func coversOpenSlots(rules priceRules, slots []pricedSlot, at time.Time) bool {
 		}
 	}
 	return true
-}
-
-// withPlan adds the paid-plan requirement to the result of checkPublication when it is enabled.
-func (s Store) withPlan(ctx context.Context, tx pgx.Tx, eventID string, err error) error {
-	if !s.RequirePlan {
-		return err
-	}
-	var fields fieldErrors
-	if err != nil && !errors.As(err, &fields) {
-		return err
-	}
-	if fields == nil {
-		fields = make(fieldErrors)
-	}
-	var stands int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM stands
-		WHERE event_id = $1 AND removed_at IS NULL AND active`, eventID).Scan(&stands); err != nil {
-		return err
-	}
-	issue, err := planIssue(ctx, tx, eventID, stands)
-	if err != nil {
-		return err
-	}
-	if issue != "" {
-		fields["plan"] = issue
-	}
-	if len(fields) > 0 {
-		return fields
-	}
-	return nil
-}
-
-func planIssue(ctx context.Context, tx pgx.Tx, eventID string, stands int) (string, error) {
-	var capacity *int
-	err := tx.QueryRow(ctx, `SELECT capacity_stands FROM event_plan_purchases
-		WHERE event_id = $1 AND status = 'active'`, eventID).Scan(&capacity)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "Aktifkan paket acara untuk melanjutkan.", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	if capacity != nil && stands > *capacity {
-		return fmt.Sprintf("Paket mendukung maksimal %d stand aktif, denah memiliki %d.", *capacity, stands), nil
-	}
-	return "", nil
 }

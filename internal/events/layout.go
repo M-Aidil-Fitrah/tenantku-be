@@ -97,8 +97,6 @@ type publicStand struct {
 
 type publicLayout struct {
 	EventID    string        `json:"event_id"`
-	EventName  string        `json:"event_name"`
-	SlotID     *string       `json:"event_slot_id"`
 	Revision   int           `json:"revision"`
 	Width      int           `json:"width"`
 	Height     int           `json:"height"`
@@ -257,21 +255,6 @@ func (s Store) saveLayout(ctx context.Context, actor, eventID, ifMatch string, i
 		if owned.Status == "completed" || owned.Status == "cancelled" {
 			return errLayoutClosed
 		}
-		if s.RequirePlan {
-			active := 0
-			for _, stand := range input.Stands {
-				if stand.Active {
-					active++
-				}
-			}
-			issue, err := planIssue(ctx, tx, eventID, active)
-			if err != nil {
-				return err
-			}
-			if issue != "" {
-				return fieldErrors{"plan": issue}
-			}
-		}
 		current, err := currentLayoutRevision(ctx, tx, eventID)
 		if err != nil {
 			return err
@@ -334,22 +317,22 @@ func checkCategories(ctx context.Context, tx pgx.Tx, stands []layoutStand) error
 	return nil
 }
 
-// protectReservedStands preserves the identity, block, and position of allocated stands.
+// protectReservedStands refuses to remove, move, or resize a stand with an active hold, offer, or reservation.
 func protectReservedStands(ctx context.Context, tx pgx.Tx, eventID string, stands []layoutStand) error {
-	rows, err := tx.Query(ctx, `SELECT s.id::text, s.code, COALESCE(s.block_id::text, ''), s.x, s.y, s.width, s.height, s.rotation FROM stands s
+	rows, err := tx.Query(ctx, `SELECT s.id::text, s.code, s.x, s.y, s.width, s.height, s.rotation FROM stands s
 		WHERE s.event_id = $1 AND s.removed_at IS NULL AND EXISTS (SELECT 1 FROM allocations a
 		WHERE a.event_id = s.event_id AND a.stand_id = s.id AND a.status IN ('hold', 'offer', 'reserved'))`, eventID)
 	if err != nil {
 		return err
 	}
 	type reserved struct {
-		id, code, blockID string
-		rect              layoutRect
-		rotation          int
+		id, code string
+		rect     layoutRect
+		rotation int
 	}
 	locked, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (reserved, error) {
 		var value reserved
-		err := row.Scan(&value.id, &value.code, &value.blockID, &value.rect.X, &value.rect.Y, &value.rect.Width, &value.rect.Height, &value.rotation)
+		err := row.Scan(&value.id, &value.code, &value.rect.X, &value.rect.Y, &value.rect.Width, &value.rect.Height, &value.rotation)
 		return value, err
 	})
 	if err != nil {
@@ -361,8 +344,7 @@ func protectReservedStands(ctx context.Context, tx pgx.Tx, eventID string, stand
 	}
 	for _, stand := range locked {
 		updated, kept := next[stand.id]
-		if !kept || updated.Code != stand.code || existing(updated.BlockID, "") != stand.blockID ||
-			updated.layoutRect != stand.rect || updated.Rotation != stand.rotation || !updated.Active {
+		if !kept || updated.layoutRect != stand.rect || updated.Rotation != stand.rotation || !updated.Active {
 			return reservedStandError{code: stand.code}
 		}
 	}
@@ -487,10 +469,9 @@ func loadLayout(ctx context.Context, tx pgx.Tx, eventID string) (layoutRevision,
 // publicLayoutFor adds availability and current prices. Only published and live events are visible.
 func (s Store) publicLayoutFor(ctx context.Context, eventID string) (publicLayout, error) {
 	var result publicLayout
-	err := pgx.BeginTxFunc(ctx, s.DB, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
-		var status, name string
-		var at time.Time
-		if err := tx.QueryRow(ctx, `SELECT status, name, transaction_timestamp() FROM events WHERE id = $1`, eventID).Scan(&status, &name, &at); err != nil {
+	err := pgx.BeginTxFunc(ctx, s.DB, pgx.TxOptions{AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+		var status string
+		if err := tx.QueryRow(ctx, `SELECT status FROM events WHERE id = $1`, eventID).Scan(&status); err != nil {
 			return err
 		}
 		if status != "published" && status != "live" {
@@ -500,33 +481,25 @@ func (s Store) publicLayoutFor(ctx context.Context, eventID string) (publicLayou
 		if err != nil {
 			return err
 		}
-		slotID, slotEnds, err := publicLayoutSlot(ctx, tx, eventID, at)
+		taken, err := takenStands(ctx, tx, eventID)
 		if err != nil {
 			return err
 		}
-		taken, err := takenStands(ctx, tx, eventID, slotID, at)
-		if err != nil {
-			return err
-		}
-		prices, err := standPrices(ctx, tx, eventID, slotID, at, layout, taken)
+		prices, err := standPrices(ctx, tx, eventID, layout, taken)
 		if err != nil {
 			return err
 		}
 		result = publicLayout{
-			EventID: layout.EventID, EventName: name, Revision: layout.Revision, Width: layout.Width, Height: layout.Height,
+			EventID: layout.EventID, Revision: layout.Revision, Width: layout.Width, Height: layout.Height,
 			CellMeters: layout.CellMeters, Blocks: layout.Blocks, Areas: layout.Areas,
 			Stands: make([]publicStand, 0, len(layout.Stands)),
 		}
-		if slotEnds.After(at) {
-			result.SlotID = &slotID
-		}
 		for _, stand := range layout.Stands {
 			value := publicStand{layoutStand: stand, Status: "available", BasePrice: prices[stand.ID]}
-			confirmed, allocated := taken[stand.ID]
 			switch {
-			case confirmed:
+			case taken[stand.ID] == "reserved":
 				value.Status = "booked"
-			case result.SlotID == nil || !stand.Active || allocated:
+			case !stand.Active || taken[stand.ID] != "":
 				value.Status = "unavailable"
 			}
 			result.Stands = append(result.Stands, value)
@@ -536,26 +509,23 @@ func (s Store) publicLayoutFor(ctx context.Context, eventID string) (publicLayou
 	return result, err
 }
 
-func publicLayoutSlot(ctx context.Context, tx pgx.Tx, eventID string, at time.Time) (string, time.Time, error) {
-	var slotID string
-	var slotEnds time.Time
-	err := tx.QueryRow(ctx, `SELECT id::text, ends_at FROM event_slots
-		WHERE event_id = $1 ORDER BY (ends_at > $2) DESC, starts_at, id LIMIT 1`, eventID, at).Scan(&slotID, &slotEnds)
-	return slotID, slotEnds, err
-}
-
-// standPrices quotes each active stand with the active pricing rules for the selected slot.
-func standPrices(ctx context.Context, tx pgx.Tx, eventID, slotID string, at time.Time, layout layoutRevision, confirmedByStand map[string]bool) (map[string]*int64, error) {
+// standPrices quotes each active stand with the active pricing rules for the whole-event slot.
+func standPrices(ctx context.Context, tx pgx.Tx, eventID string, layout layoutRevision, taken map[string]string) (map[string]*int64, error) {
 	prices := make(map[string]*int64, len(layout.Stands))
-	active, err := loadPriceVersion(ctx, tx, activePricingQuery, eventID, at)
+	active, err := loadPriceVersion(ctx, tx, activePricingQuery, eventID, time.Now())
 	if err != nil || active == nil {
+		return prices, err
+	}
+	var slotID string
+	err = tx.QueryRow(ctx, `SELECT id::text FROM event_slots WHERE event_id = $1 ORDER BY starts_at, id LIMIT 1`, eventID).Scan(&slotID)
+	if err != nil {
 		return prices, err
 	}
 	capacity, confirmed := int32(0), int32(0)
 	for _, stand := range layout.Stands {
 		if stand.Active {
 			capacity++
-			if confirmedByStand[stand.ID] {
+			if taken[stand.ID] == "reserved" {
 				confirmed++
 			}
 		}
@@ -587,18 +557,6 @@ func standPrices(ctx context.Context, tx pgx.Tx, eventID, slotID string, at time
 type LayoutInventory struct{}
 
 var _ HoldInventory = LayoutInventory{}
-
-func (LayoutInventory) ReadyToPublish(ctx context.Context, tx pgx.Tx, eventID string, slotIDs []string) (bool, error) {
-	if len(slotIDs) == 0 {
-		return false, nil
-	}
-	// All slots share the event layout, so one active stand covers every slot.
-	var ready bool
-	err := tx.QueryRow(ctx, `SELECT EXISTS (
-		SELECT 1 FROM stands WHERE event_id = $1 AND removed_at IS NULL AND active
-	)`, eventID).Scan(&ready)
-	return ready, err
-}
 
 func (LayoutInventory) ActiveStands(ctx context.Context, tx pgx.Tx, eventID, _ string) ([]HoldStand, error) {
 	rows, err := tx.Query(ctx, `SELECT s.id::text, s.code, s.block_id::text, COALESCE(b.label, ''), s.category_ids::text[]

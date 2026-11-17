@@ -104,7 +104,6 @@ func (source HoldOfferSource) ResolveOffer(ctx context.Context, tx pgx.Tx, reque
 	}
 
 	offer := booking.Offer{
-		StandCode: selected.Code, BlockLabel: selected.BlockLabel,
 		BlockID: selected.BlockID, PriceRevision: revision, Rent: quote.Rent,
 		PlatformFee: policy.PlatformFee, ProviderFee: policy.ProviderFee,
 		PolicyVersion: policy.Version, RefundPolicy: policy.Refund,

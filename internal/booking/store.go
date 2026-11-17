@@ -24,33 +24,21 @@ type Price struct {
 }
 
 type Booking struct {
-	ID            string         `json:"booking_id"`
-	BusinessID    string         `json:"business_id"`
-	EventID       string         `json:"event_id"`
-	EventName     string         `json:"event_name"`
-	EventStatus   string         `json:"event_status"`
-	StandID       string         `json:"stand_id"`
-	SlotID        string         `json:"event_slot_id"`
-	Status        string         `json:"status"`
-	ExpiresAt     time.Time      `json:"expires_at"`
-	CreatedAt     time.Time      `json:"created_at"`
-	PolicyVersion string         `json:"accepted_policy_version"`
-	Price         Price          `json:"price"`
-	Refund        *bookingRefund `json:"refund,omitempty"`
-	ServerNow     time.Time      `json:"-"`
+	ID            string    `json:"booking_id"`
+	BusinessID    string    `json:"business_id"`
+	EventID       string    `json:"event_id"`
+	EventName     string    `json:"event_name"`
+	StandID       string    `json:"stand_id"`
+	SlotID        string    `json:"event_slot_id"`
+	Status        string    `json:"status"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	CreatedAt     time.Time `json:"created_at"`
+	PolicyVersion string    `json:"accepted_policy_version"`
+	Price         Price     `json:"price"`
+	ServerNow     time.Time `json:"-"`
 }
 
-type bookingRefund struct {
-	Amount int64  `json:"amount"`
-	Status string `json:"status"`
-}
-
-type bookingListItem struct {
-	Booking
-	NeedsRevisionResponse bool `json:"needs_revision_response"`
-}
-
-const bookingColumns = `b.id, b.business_id, b.event_id, e.name, e.status, a.stand_id, a.event_slot_id,
+const bookingColumns = `b.id, b.business_id, b.event_id, e.name, a.stand_id, a.event_slot_id,
 	CASE WHEN b.status IN ('held', 'payment_pending') AND b.expires_at <= statement_timestamp()
 		THEN 'expired' ELSE b.status END,
 	b.expires_at, b.created_at, b.refund_policy_version, b.rent, b.platform_fee, b.provider_fee,
@@ -62,25 +50,18 @@ func (s Store) Ready(ctx context.Context) error {
 }
 
 func (s Store) detail(ctx context.Context, actor, id string) (Booking, error) {
-	row := s.DB.QueryRow(ctx, `SELECT `+bookingColumns+`, r.amount, r.status FROM bookings b
+	row := s.DB.QueryRow(ctx, `SELECT `+bookingColumns+` FROM bookings b
 		JOIN allocations a ON a.booking_id = b.id
 		JOIN events e ON e.id = b.event_id
-		LEFT JOIN event_cancellation_refunds r ON r.booking_id = b.id
 		WHERE b.id = $1 AND EXISTS (
 			SELECT 1 FROM memberships m WHERE m.user_id = $2 AND m.role = 'owner'
 			AND (m.business_id = b.business_id OR m.organization_id = e.organization_id)
 		)`, id, actor)
-	var amount *int64
-	var status *string
-	booking, err := scanBooking(row, &amount, &status)
-	if err == nil && amount != nil && status != nil {
-		booking.Refund = &bookingRefund{Amount: *amount, Status: *status}
-	}
-	return booking, err
+	return scanBooking(row)
 }
 
-func (s Store) list(ctx context.Context, actor, businessID string, before time.Time, beforeID *string, limit int, pendingOnly bool) ([]bookingListItem, time.Time, error) {
-	bookings := make([]bookingListItem, 0)
+func (s Store) list(ctx context.Context, actor, businessID string, before time.Time, beforeID *string, limit int) ([]Booking, time.Time, error) {
+	bookings := make([]Booking, 0)
 	var serverNow time.Time
 	err := pgx.BeginTxFunc(ctx, s.DB, pgx.TxOptions{
 		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
@@ -90,31 +71,15 @@ func (s Store) list(ctx context.Context, actor, businessID string, before time.T
 			WHERE user_id = $1 AND business_id = $2 AND role = 'owner'`, actor, businessID).Scan(&business, &serverNow); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT `+bookingColumns+`, revision.pending FROM bookings b
+		rows, err := tx.Query(ctx, `SELECT `+bookingColumns+` FROM bookings b
 			JOIN allocations a ON a.booking_id = b.id JOIN events e ON e.id = b.event_id
-			CROSS JOIN LATERAL (
-				SELECT e.status IN ('published', 'live') AND (
-					b.status = 'confirmed' OR (b.status IN ('held', 'payment_pending') AND b.expires_at > statement_timestamp())
-				) AND EXISTS (
-					SELECT 1 FROM event_revision_bookings rb JOIN event_revisions r ON r.id = rb.revision_id
-					WHERE rb.booking_id = b.id AND NOT EXISTS (
-						SELECT 1 FROM event_revision_decisions d WHERE d.revision_id = rb.revision_id AND d.booking_id = b.id
-					) AND NOT EXISTS (
-						SELECT 1 FROM event_revision_applications app
-						WHERE app.event_id = r.event_id AND app.supersedes_through >= r.revision
-					)
-				) AS pending
-			) revision
 			WHERE b.business_id = $1 AND ($2::uuid IS NULL OR (b.created_at, b.id) < ($3, $2))
-			AND (NOT $5::boolean OR revision.pending)
-			ORDER BY b.created_at DESC, b.id DESC LIMIT $4`, business, beforeID, before, limit, pendingOnly)
+			ORDER BY b.created_at DESC, b.id DESC LIMIT $4`, business, beforeID, before, limit)
 		if err != nil {
 			return err
 		}
-		bookings, err = pgx.AppendRows(bookings, rows, func(row pgx.CollectableRow) (bookingListItem, error) {
-			var pending bool
-			booking, err := scanBooking(row, &pending)
-			return bookingListItem{Booking: booking, NeedsRevisionResponse: pending}, err
+		bookings, err = pgx.AppendRows(bookings, rows, func(row pgx.CollectableRow) (Booking, error) {
+			return scanBooking(row)
 		})
 		if len(bookings) > 0 {
 			serverNow = bookings[0].ServerNow
@@ -124,13 +89,12 @@ func (s Store) list(ctx context.Context, actor, businessID string, before time.T
 	return bookings, serverNow, err
 }
 
-func scanBooking(row pgx.Row, extra ...any) (Booking, error) {
+func scanBooking(row pgx.Row) (Booking, error) {
 	var result Booking
 	result.Price.Currency = "IDR"
-	fields := []any{&result.ID, &result.BusinessID, &result.EventID, &result.EventName, &result.EventStatus, &result.StandID, &result.SlotID, &result.Status,
+	err := row.Scan(&result.ID, &result.BusinessID, &result.EventID, &result.EventName, &result.StandID, &result.SlotID, &result.Status,
 		&result.ExpiresAt, &result.CreatedAt, &result.PolicyVersion, &result.Price.Rent, &result.Price.PlatformFee,
-		&result.Price.ProviderFee, &result.Price.Total, &result.Price.Version, &result.ServerNow}
-	err := row.Scan(append(fields, extra...)...)
+		&result.Price.ProviderFee, &result.Price.Total, &result.Price.Version, &result.ServerNow)
 	return result, err
 }
 

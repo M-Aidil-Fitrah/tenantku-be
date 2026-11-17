@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -22,7 +21,6 @@ import (
 	"kitakarsa.com/tenantku/backend/internal/booking"
 	"kitakarsa.com/tenantku/backend/internal/events"
 	"kitakarsa.com/tenantku/backend/internal/identity"
-	"kitakarsa.com/tenantku/backend/internal/payment"
 	"kitakarsa.com/tenantku/backend/internal/platform/httpapi"
 )
 
@@ -46,18 +44,6 @@ func main() {
 		}
 		return
 	}
-	if len(os.Args) > 1 && os.Args[1] == "hold-policy" {
-		if err := installHoldPolicy(ctx, os.Args[2:]); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-	if len(os.Args) > 1 && os.Args[1] == "record-va-refund" {
-		if err := recordVARefund(ctx, os.Args[2:]); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
 
 	if err := run(ctx); err != nil {
 		log.Fatal(err)
@@ -65,31 +51,6 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	var maxActiveHolds int
-	if raw := os.Getenv("BOOKING_MAX_ACTIVE_HOLDS"); raw != "" {
-		limit, err := strconv.Atoi(raw)
-		if err != nil || limit != 1 {
-			return errors.New("BOOKING_MAX_ACTIVE_HOLDS must be 1 or empty")
-		}
-		maxActiveHolds = limit
-	}
-	holdDuration := 30 * time.Minute
-	if raw := os.Getenv("BOOKING_HOLD_DURATION"); raw != "" {
-		duration, err := time.ParseDuration(raw)
-		if err != nil || duration < time.Second {
-			return errors.New("BOOKING_HOLD_DURATION must be a duration of at least 1s, for example 30m")
-		}
-		holdDuration = duration
-	}
-	offerDuration := 24 * time.Hour
-	if raw := os.Getenv("BOOKING_OFFER_DURATION"); raw != "" {
-		duration, err := time.ParseDuration(raw)
-		if err != nil || duration < time.Second {
-			return errors.New("BOOKING_OFFER_DURATION must be a duration of at least 1s, for example 24h")
-		}
-		offerDuration = duration
-	}
-	planRequired := os.Getenv("EVENT_PLAN_REQUIRED") == "true"
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -111,7 +72,6 @@ func run(ctx context.Context) error {
 	api := router.Group("/api/v1", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 	})
-	holdEnabled := false
 	if databaseURL := os.Getenv("DATABASE_URL"); databaseURL != "" {
 		origin, err := appOrigin(os.Getenv("APP_ORIGIN"))
 		if err != nil {
@@ -129,19 +89,9 @@ func run(ctx context.Context) error {
 			cancel()
 			return err
 		}
-		// Verified email is required by default (E02-09). Set AUTH_REQUIRE_VERIFIED_EMAIL=false only for local QA.
-		service.RequireVerifiedEmail(os.Getenv("AUTH_REQUIRE_VERIFIED_EMAIL") != "false")
 		profiles := identity.Store{DB: pool}
-		eventStore := events.Store{DB: pool, PricingInventory: events.LayoutInventory{}, RequirePlan: planRequired}
+		eventStore := events.Store{DB: pool, PricingInventory: events.LayoutInventory{}}
 		bookings := booking.Store{DB: pool}
-		payments := payment.Store{DB: pool, PlanRequired: planRequired}
-		if key := os.Getenv("MIDTRANS_SERVER_KEY"); key != "" {
-			if os.Getenv("MIDTRANS_ENV") != "sandbox" {
-				cancel()
-				return errors.New("MIDTRANS_ENV must be sandbox to enable payments")
-			}
-			payments.Provider = payment.NewMidtrans(key, "sandbox")
-		}
 		checkSchema := func(probe context.Context) error {
 			if err := profiles.Ready(probe); err != nil {
 				return fmt.Errorf("identity schema unavailable; run make migrate: %w", err)
@@ -151,19 +101,6 @@ func run(ctx context.Context) error {
 			}
 			if err := bookings.Ready(probe); err != nil {
 				return fmt.Errorf("booking schema unavailable; run make migrate: %w", err)
-			}
-			if maxActiveHolds > 0 {
-				if _, err := pool.Exec(probe, "SELECT id FROM applications LIMIT 0"); err != nil {
-					return fmt.Errorf("application schema unavailable; run make migrate: %w", err)
-				}
-				if _, err := pool.Exec(probe, "SELECT version FROM hold_policy_versions LIMIT 0"); err != nil {
-					return fmt.Errorf("hold policy store unavailable; check migrations and booking grants: %w", err)
-				}
-			}
-			if payments.Provider != nil || planRequired {
-				if err := payments.Ready(probe); err != nil {
-					return fmt.Errorf("payment schema unavailable; check migrations and sandbox grants: %w", err)
-				}
 			}
 			return nil
 		}
@@ -185,22 +122,7 @@ func run(ctx context.Context) error {
 		service.Routes(api, origin)
 		profiles.Routes(api, service, origin)
 		eventStore.Routes(api, service, origin)
-		if err := eventStore.PublishRoutes(api, service, origin, events.LayoutInventory{}); err != nil {
-			return err
-		}
 		bookings.Routes(api, service)
-		if maxActiveHolds > 0 {
-			source := events.HoldOfferSource{Inventory: events.LayoutInventory{}, Policies: events.StoredHoldPolicies{}}
-			settings := booking.HoldSettings{Lifetime: holdDuration, MaxActive: maxActiveHolds}
-			if err := bookings.HoldRoutes(api, service, origin, settings, source); err != nil {
-				return err
-			}
-			if err := bookings.ApplicationRoutes(api, service, origin, offerDuration, maxActiveHolds, source); err != nil {
-				return err
-			}
-			holdEnabled = true
-		}
-		payments.Routes(api, service, origin)
 		router.GET("/readyz", func(c *gin.Context) {
 			probe, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 			defer cancel()
@@ -226,18 +148,8 @@ func run(ctx context.Context) error {
 		api.POST("/auth/verify-email", unavailable)
 		api.POST("/auth/resend-verification", unavailable)
 		identity.Store{}.Routes(api, nil, "")
-		api.GET("/events/:id/publication-readiness", unavailable)
-		api.POST("/events/:id/publish", unavailable)
 		events.Store{}.Routes(api, nil, "")
 		booking.Store{}.Routes(api, nil)
-		payment.Store{}.Routes(api, nil, "")
-	}
-	if !holdEnabled {
-		unavailable := func(c *gin.Context) {
-			httpapi.Error(c, http.StatusServiceUnavailable, "HOLD_UNAVAILABLE", "Layanan hold belum tersedia.", nil)
-		}
-		api.POST("/bookings/hold-quote", unavailable)
-		api.POST("/bookings/holds", unavailable)
 	}
 
 	server := &http.Server{

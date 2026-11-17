@@ -14,8 +14,6 @@ import (
 var (
 	errConflict = errors.New("account already exists")
 	errSession  = errors.New("invalid session")
-	// errBadCategory means the chosen business category does not exist.
-	errBadCategory = errors.New("unknown business category")
 )
 
 type Account struct {
@@ -27,35 +25,21 @@ type repository struct {
 	db *pgxpool.Pool
 }
 
-func (r repository) createAccount(ctx context.Context, email string, hash []byte, signup *Signup) (Account, error) {
+func (r repository) createAccount(ctx context.Context, email string, hash []byte) (Account, error) {
 	account := Account{Email: email}
-	err := pgx.BeginFunc(ctx, r.db, func(tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id", email, hash).
-			Scan(&account.ID); err != nil {
-			return err
-		}
-		if signup == nil {
-			return nil
-		}
-		return signup.store(ctx, tx, account.ID)
-	})
+	err := r.db.QueryRow(ctx, "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id", email, hash).Scan(&account.ID)
 	var pgErr *pgconn.PgError
-	switch {
-	case errors.As(err, &pgErr) && pgErr.Code == "23505":
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 		return Account{}, errConflict
-	case errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == "businesses_category_id_fkey":
-		return Account{}, errBadCategory
 	}
 	return account, err
 }
 
-func (r repository) credentials(ctx context.Context, email string) (Account, []byte, bool, error) {
+func (r repository) credentials(ctx context.Context, email string) (Account, []byte, error) {
 	account := Account{Email: email}
 	var hash []byte
-	var verified bool
-	err := r.db.QueryRow(ctx, "SELECT id, password_hash, email_verified_at IS NOT NULL FROM users WHERE email = $1", email).
-		Scan(&account.ID, &hash, &verified)
-	return account, hash, verified, err
+	err := r.db.QueryRow(ctx, "SELECT id, password_hash FROM users WHERE email = $1", email).Scan(&account.ID, &hash)
+	return account, hash, err
 }
 
 func (r repository) createSession(ctx context.Context, userID string, expires time.Time, passwordHash, refreshHash []byte) (string, error) {

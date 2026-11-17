@@ -39,18 +39,11 @@ func (s Store) Routes(api *gin.RouterGroup, sessions *auth.Service, origin strin
 type accountProfile struct {
 	auth.Account
 	Memberships []membership `json:"memberships"`
-	// Phone and PlannedEventName come from the registration form and are absent for older accounts.
-	Phone            *string `json:"phone,omitempty"`
-	PlannedEventName *string `json:"planned_event_name,omitempty"`
 }
 
 func (s Store) me(c *gin.Context, account auth.Account) {
-	profile := accountProfile{Account: account}
-	var err error
-	if profile.Memberships, err = s.memberships(c.Request.Context(), account.ID); err == nil {
-		profile.Phone, profile.PlannedEventName, err = s.signup(c.Request.Context(), account.ID)
-	}
-	writeResult(c, http.StatusOK, profile, err)
+	memberships, err := s.memberships(c.Request.Context(), account.ID)
+	writeResult(c, http.StatusOK, accountProfile{Account: account, Memberships: memberships}, err)
 }
 
 func (s Store) listPublicCategories(c *gin.Context) {
@@ -232,8 +225,6 @@ func writeResult(c *gin.Context, status int, data any, err error) {
 		httpapi.Success(c, status, data)
 	case errors.Is(err, pgx.ErrNoRows):
 		httpapi.Error(c, http.StatusNotFound, "NOT_FOUND", "Profil tidak ditemukan.", nil)
-	case errors.Is(err, errBusinessAlreadyExists):
-		httpapi.Error(c, http.StatusConflict, "BUSINESS_ALREADY_EXISTS", "Akun ini sudah memiliki profil usaha.", nil)
 	case errors.As(err, &dbError) && dbError.ConstraintName == "businesses_category_id_fkey":
 		validate(c, map[string]string{"category_id": "Pilih kategori usaha yang tersedia."})
 	default:
