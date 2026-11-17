@@ -410,8 +410,7 @@ func replaceLayoutItems(ctx context.Context, tx pgx.Tx, eventID string, input la
 		WHERE event_id = $1 AND removed_at IS NULL AND id <> ALL($2::text[]::uuid[])`, eventID, keepStands); err != nil {
 		return err
 	}
-	// Kode sementara dari hash seluruh ID: ID yang awalannya sama tidak boleh bertabrakan di indeks kode.
-	if _, err := tx.Exec(ctx, `UPDATE stands SET code = '~' || left(md5(id::text), 11)
+	if _, err := tx.Exec(ctx, `UPDATE stands SET code = '~' || left(id::text, 11)
 		WHERE event_id = $1 AND removed_at IS NULL`, eventID); err != nil {
 		return err
 	}

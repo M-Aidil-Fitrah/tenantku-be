@@ -22,6 +22,7 @@ import (
 	"kitakarsa.com/tenantku/backend/internal/auth"
 	"kitakarsa.com/tenantku/backend/internal/booking"
 	"kitakarsa.com/tenantku/backend/internal/events"
+	"kitakarsa.com/tenantku/backend/internal/funds"
 	"kitakarsa.com/tenantku/backend/internal/identity"
 	"kitakarsa.com/tenantku/backend/internal/inventory"
 	"kitakarsa.com/tenantku/backend/internal/messaging"
@@ -30,7 +31,6 @@ import (
 	"kitakarsa.com/tenantku/backend/internal/platform/httpapi"
 	"kitakarsa.com/tenantku/backend/internal/reports"
 	"kitakarsa.com/tenantku/backend/internal/reviews"
-	"kitakarsa.com/tenantku/backend/internal/uploads"
 )
 
 func main() {
@@ -67,12 +67,6 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "hold-policy" {
 		if err := installHoldPolicy(ctx, os.Args[2:]); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-	if len(os.Args) > 1 && os.Args[1] == "record-va-refund" {
-		if err := recordVARefund(ctx, os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -159,12 +153,6 @@ func run(ctx context.Context) error {
 		notifications := notify.Store{DB: pool}
 		chats := messaging.Store{DB: pool}
 		reviewStore := reviews.Store{DB: pool}
-		uploadDir := os.Getenv("UPLOAD_DIR")
-		if uploadDir == "" {
-			uploadDir = "data/uploads"
-		}
-		files := uploads.Store{DB: pool, Storage: uploads.LocalStorage{Dir: uploadDir},
-			Key: uploads.SigningKey(os.Getenv("JWT_SIGNING_KEY")), Origin: origin}
 		payments := payment.Store{DB: pool, PlanRequired: planRequired}
 		if key := os.Getenv("MIDTRANS_SERVER_KEY"); key != "" {
 			if os.Getenv("MIDTRANS_ENV") != "sandbox" {
@@ -172,6 +160,12 @@ func run(ctx context.Context) error {
 				return errors.New("MIDTRANS_ENV must be sandbox to enable payments")
 			}
 			payments.Provider = payment.NewMidtrans(key, "sandbox")
+		}
+		// E09 needs the payment grants, so it follows the same switch as payments.
+		fundsEnabled := payments.Provider != nil || planRequired
+		fundStore := funds.Store{}
+		if fundsEnabled {
+			fundStore = funds.Store{DB: pool, Provider: payments.Provider}
 		}
 		checkSchema := func(probe context.Context) error {
 			if err := profiles.Ready(probe); err != nil {
@@ -201,15 +195,17 @@ func run(ctx context.Context) error {
 			if err := reviewStore.Ready(probe); err != nil {
 				return fmt.Errorf("review schema unavailable; run make migrate: %w", err)
 			}
-			if err := files.Ready(probe); err != nil {
-				return fmt.Errorf("upload store unavailable; run make migrate and check UPLOAD_DIR: %w", err)
-			}
 			if maxActiveHolds > 0 {
 				if _, err := pool.Exec(probe, "SELECT id FROM applications LIMIT 0"); err != nil {
 					return fmt.Errorf("application schema unavailable; run make migrate: %w", err)
 				}
 				if _, err := pool.Exec(probe, "SELECT version FROM hold_policy_versions LIMIT 0"); err != nil {
 					return fmt.Errorf("hold policy store unavailable; check migrations and booking grants: %w", err)
+				}
+			}
+			if fundsEnabled {
+				if err := fundStore.Ready(probe); err != nil {
+					return fmt.Errorf("funds schema unavailable; run make migrate and apply runtime grants: %w", err)
 				}
 			}
 			if payments.Provider != nil || planRequired {
@@ -247,7 +243,6 @@ func run(ctx context.Context) error {
 		notifications.Routes(api, service, origin)
 		chats.Routes(api, service, origin)
 		reviewStore.Routes(api, service, origin)
-		files.Routes(api, service, origin)
 		if maxActiveHolds > 0 {
 			source := events.HoldOfferSource{Inventory: events.LayoutInventory{}, Policies: events.StoredHoldPolicies{}}
 			settings := booking.HoldSettings{Lifetime: holdDuration, MaxActive: maxActiveHolds}
@@ -260,6 +255,7 @@ func run(ctx context.Context) error {
 			holdEnabled = true
 		}
 		payments.Routes(api, service, origin)
+		fundStore.Routes(api, service, origin)
 		router.GET("/readyz", func(c *gin.Context) {
 			probe, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 			defer cancel()
@@ -295,8 +291,8 @@ func run(ctx context.Context) error {
 		notify.Store{}.Routes(api, nil, "")
 		messaging.Store{}.Routes(api, nil, "")
 		reviews.Store{}.Routes(api, nil, "")
-		uploads.Store{}.Routes(api, nil, "")
 		payment.Store{}.Routes(api, nil, "")
+		funds.Store{}.Routes(api, nil, "")
 	}
 	if !holdEnabled {
 		unavailable := func(c *gin.Context) {
